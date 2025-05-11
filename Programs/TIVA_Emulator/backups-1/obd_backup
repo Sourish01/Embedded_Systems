@@ -1,0 +1,170 @@
+import time
+from collections import deque
+from meters import *
+
+class CANProcessor:
+    def __init__(self, max_messages=100):
+        self.max_messages = max_messages
+        self.can_messages = deque(maxlen=max_messages)
+        self.buffer = bytearray()
+        self.target_id = 0x7DF  # CAN ID we're looking for
+
+        self.engine_meter = None
+        self.speed_meter = None
+        self.pressure_gauge = None
+        self.throttle_slider = None
+        self.maf_meter = None
+    
+    def set_meters(self, engine_meter, speed_meter, pressure_gauge, throttle_slider, maf_meter):
+        """Set references to the meter objects"""
+        self.engine_meter = engine_meter
+        self.speed_meter = speed_meter
+        self.pressure_gauge = pressure_gauge
+        self.throttle_slider = throttle_slider
+        self.maf_meter = maf_meter
+        
+    def CAN_send_serial(self, pid):
+        """Send current meter values based on PID request"""
+        if not all([self.engine_meter, self.speed_meter, self.pressure_gauge, 
+                   self.throttle_slider, self.maf_meter]):
+            print("Error: Meter references not set")
+            return None
+            
+        if pid == 0x0C:  # Engine RPM (0-16384)
+            rpm = self.engine_meter.current_value
+            # Convert to CAN format (value * 4 as 2 bytes)
+            byte1 = (rpm * 4) >> 8
+            byte2 = (rpm * 4) & 0xFF
+            return bytes([0x07, 0xE8, 0x04, 0x41, pid, byte1, byte2,0x00,0x00,0x00])
+            
+        elif pid == 0x0D:  # Vehicle Speed (0-255 km/h)
+            speed = self.speed_meter.current_value
+            return bytes([0x07, 0xE8, 0x03, 0x41, pid, speed,0x00,0x00,0x00,0x00])
+            
+        elif pid == 0x0A:  # Fuel Pressure (0-765 kPa)
+            pressure = self.pressure_gauge.current_value
+            # Convert kPa to CAN format (1 byte = kPa * 3)
+            can_value = int(pressure / 3)
+            return bytes([0x07, 0xE8, 0x03, 0x41, pid, can_value,0x00,0x00,0x00,0x00])
+            
+        elif pid == 0x11:  # Throttle Position (0-100%)
+            throttle = self.throttle_slider.slider.get()
+            # Convert percentage to CAN format (1 byte = percentage * 2.55)
+            can_value = int(throttle * 2.55)
+            return bytes([0x07, 0xE8, 0x03, 0x41, pid, can_value,0x00,0x00,0x00,0x00])
+            
+        elif pid == 0x10:  # Mass Air Flow (0-655 g/sec)
+            maf = self.maf_meter.current_value
+            # Convert to CAN format (value / 100 as 2 bytes)
+            scaled = int(maf * 100)
+            byte1 = scaled >> 8
+            byte2 = scaled & 0xFF
+            return bytes([0x07, 0xE8, 0x04, 0x41, pid, byte1, byte2,0x00,0x00,0x00])
+            
+        else:
+            print(f"Unsupported PID: {pid:02X}")
+            return None
+        
+    def process_data(self, data):
+        """Process incoming UART data stream containing CAN frames"""
+        try:
+            if isinstance(data, str):
+                try:
+                    data = bytes.fromhex(data.replace(' ', ''))
+                except ValueError:
+                    return
+            
+            self.buffer.extend(data)
+            
+            while len(self.buffer) >= 9:  # Minimum frame size
+                if self.buffer[0] != 0xDF:
+                    self.buffer.pop(0)
+                    continue
+                
+                # Check length byte is present
+                length = self.buffer[1]
+                if len(self.buffer) < 2 + length:
+                    break  # Wait for more data
+
+                frame = self.buffer[:2 + length]
+                del self.buffer[:2 + length]
+                self._process_frame(frame)
+        except Exception as e:
+            print(f"CAN processing error: {e}")
+            self.buffer.clear()
+
+
+    def _find_can_frame(self):
+        """Search buffer for valid CAN frames"""
+        # Try both byte orders for ID
+        for offset in [0, 1]:
+            if len(self.buffer) < offset + 2:
+                continue
+                
+            # Check for 7DF in either byte order
+            id_byte1, id_byte2 = self.buffer[offset], self.buffer[offset + 1]
+            can_id = (id_byte1 << 8) + id_byte2
+            
+            if can_id == self.target_id:
+                frame_length = min(11, len(self.buffer) - offset)  # 2B ID + up to 8B data
+                frame = bytes(self.buffer[offset:offset + frame_length])
+                del self.buffer[:offset + frame_length]
+                
+                self._process_frame(frame)
+                return True
+                
+        # No valid frame found, discard leading byte
+        if len(self.buffer) > 0:
+            self.buffer.pop(0)
+        return False
+
+    def _process_frame(self, frame):
+        """Process a complete CAN-like frame starting with 0xDF"""
+        try:
+            if frame[0] != 0xDF:
+                return
+            elif frame[1] != 0x07:
+                return
+            else :
+                length = frame[2]
+                payload = frame[3:3+length]
+                
+                if len(payload) < length:
+                    print("Incomplete CAN payload")
+                    return
+                else:
+                    mode = payload[0]
+                    pid = payload[1]
+                    data_bytes = payload[2:]
+                    
+                    response = self.CAN_send_serial(pid)
+
+                    # Example interpretation for PID 0C = Engine RPM
+                    if pid == 0x0C:
+                        #rpm = ((data_bytes[0] << 8) | data_bytes[1]) / 4
+                        print(f"Engine RPM:")
+                        
+                    elif pid == 0x10:
+                        print(f"Mass air flow \n")
+                    
+                    elif pid == 0x0D:
+                        print(f"Vehicle Speed \n")
+                        
+                    elif pid == 0x0A:
+                        print(f"Fuel Pressure \n")
+                    
+                    elif pid == 0x11:
+                        print(f"Throttle Position\n")
+
+                    # Store as hex
+                    hex_payload = ' '.join(f"{b:02X}" for b in payload)
+                    msg = f"DF {length:02X} {hex_payload}"
+                    self.can_messages.append(msg)
+                    print(f"CAN: {msg}")
+        except Exception as e:
+            print(f"Frame processing error: {e}")
+
+
+    def get_messages(self):
+        return list(self.can_messages)
+    
